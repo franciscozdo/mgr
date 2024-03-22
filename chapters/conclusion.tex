@@ -1,0 +1,52 @@
+\chapter{Conclusion}
+\label{chapter:conclusion}
+
+In this thesis I have presented the design of Virtual Memory subsystem in a UNIX system.
+In particular we have seen the details of the part responsible for managing the processes memory.
+Moreover, we have seen the real implementation of the UVM virtual memory subsystem with the copy-on-write mechanism in the Mimiker OS.
+All changes to Mimiker, descibed in this thesis, are alread merged to the {\tt master} branch in the project repository, hence every user of the Mimiker OS is now using the new implementation of Virtual Memory.
+
+\section{Contributions}
+
+In previous chapters we have seen the new features added to the Mimiker while working on this thesis.
+The main goal was the effective implementation of copy-on-write mechanism.
+The one created there has improved the performance of the system as expected.
+The number of page copies has been reduced and the kernel spends less time during a {\tt fork} system call thanks to that improvement.
+
+Additionally, in order to make the process of implementing copy-on-write mechanism easier, I have reworked the implementation of the virtual memory map structures.
+Their new design, based on the UVM, is more modular, because of different structures used to describe different types of memory.
+It not only made the implementation of copy-on-write simpler, but will also help with implementing other features of virtual memory subsystem in the future.
+
+Other changes, also in subsystems different from the VM, has improved the overall experience while developing Mimiker.
+The new information associated with signals has created new possibilities while designing user space tests that weren't possible before.
+In particular, the tests used to verify correctness of the VM subsystem has been improved the most.
+They were extensively used while working on new VM design.
+
+The last contribution to the Mimiker OS is the Kernel Function Trace utility.
+It was used to check if the implementation introduced earlier behaves as expected.
+Additionally, it helped with finding optimizations in the implementation of the virtual memory subsystem.
+For example, the \mintinline{c}{pmap_protect} function was optimized to operate well on large memory regions
+(before it was implemented to work effectively on on single page regions).
+
+Because the KFT is split into two independent parts: kernel part and library for analysis,
+it may be used in the future for similar performance analysis for other parts of the kernel.
+Because the Python library translates KFT dump into format that is easy to manage within Python,
+it can be used to implement any kind of analysis on the data gathered during Mimiker run.
+
+\section{Future work}
+
+As mentioned earlier, the new design will allow for gradual and simpler implementation of next features of the VM subsystem.
+Two of them, memory mapped files and paging, are the most important ones.
+Memory mapped files will use the UVM~objects as a structure to describe the memory that will reflect the contents of a file.
+However, they require also some work in the scope of Virtual File System in order to manage the files that are accessed via file system.
+The VFS implementation in Mimiker needs to be revisited and improved to make it possible to interact with other subsystems.
+
+The paging mechanism is also the one that should be possible to add in the future.
+It will implement the interaction between virtual memory and devices used to store data.
+The infrastructure needed to operate on block devices, that are used to store blocks of data, needs to be created in Mimiker.
+Once the paging mechanism is implemented, it will allow to swap out pages from main memory to the backing storage.
+
+There are also other features that can be later added, but are not essential in the Mimiker at the moment.
+For instance, the additional UVM mechanisms that were mentioned in one of the previous chapters (page loan, page transfer and map entry passing).
+They are not essential, because they solve problems that aren't currently experienced in the Mimiker, because they are used during operations that
+are impossible or not extensively used in the Mimiker (e.g. fetching large chunks of data from the internet) .

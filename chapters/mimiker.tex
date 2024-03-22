@@ -1,0 +1,603 @@
+\chapter{Implementation of UVM in Mimiker}
+\label{chapter:mimiker}
+
+The practical part of this thesis is the implementation of the UVM-like virtual memory subsystem in Mimiker.
+In this chapter, we will see the motivation behind this change, an overview of the system that has been implemented,
+and some of the related work that has been done besides the actual implementation.
+
+\section{The Mimiker Operating System}
+
+Mimiker \cite{mimiker:website} is a UNIX operating system intended for research and teaching.
+Its implementation is inspired by the systems from the BSD family.
+Its design focuses on simplicity, as the system is used to teach students about the internals and design of the UNIX kernels.
+Mimiker is still under development so there are many features that are gradually added into the kernel (one of such features is a copy-on-write support).
+
+The Mimiker repository \cite{mimiker:sources} is used to store all the code and configuration needed to build, run, and test Mimiker.
+The contents of the repository are:
+\begin{itemize}
+  \item Kernel code.
+  \item Testing infrastructure -- both kernel and userspace tests.
+  \item Userspace programs -- programs ported from the BSD systems to provide some basic user experience when launching Mimiker's shell.
+  \item Scripts used to run Mimiker in Qemu emulation \cite{qemu:website}.
+  \item Toolchain -- configuration and custom patches needed to prepare toolchain required to compile and simulate Mimiker.
+  \item Basic documentation.
+\end{itemize}
+
+The Mimiker OS is currently ported to three different architectures: MIPS (on~Malta board), ARM (on Raspberry Pi 3) and RISCV (on HiFive Unleashed).
+All these architectures support virtual memory and implement hierarchical page tables (but each of them defines different number of levels in the page table).
+Later we will not talk much about the details of these architectures,
+because they are not important to understand the implementation of virtual memory and copy-on-write mechanism.
+
+\section{Motivation}
+
+The Virtual Memory subsystem used in Mimiker was based on old BSD~VM system.
+The implementation wasn't complete, there were many features missing, in particular: copy-on-write support, memory mapped files and memory swapping.
+Some of such features are not implemented because there is no infrastructure to implement them
+(e.g. no support for block devices or unstable VFS implementation).
+
+Copy-on-write functionality doesn't require any additional subsystem to be enhanced beforehand.
+However, after evaluating the implementation of it in current VM subsystem we have discovered that it might quickly get complicated
+even if many features of virtual memory are missing.
+To reduce the complexity of implemented VM system we have decided to investigate how UVM is built and replace the old VM system with it.
+
+The integration of UVM simplified the implementation of VM system in Mimiker without losing any features.
+We have made an observation that only the part responsible for anonymous memory must be implemented, because there are no other memory types supported yet.
+(The first attempt to implement UVM in Mimiker failed without realizing this fact.)
+We also hope that the design of UVM will help to gradually implement other VM features easily.
+
+% \begin{itemize}
+%   \item currently designed with old BSD~VM, but haven't implemented much features so far
+%   \item the implementation has no CoW support
+%   \item no shadow objects, no memory mapped files, no backing storage (e.g. no support for block devices)
+%   \item not much to change to switch to UVM
+%   \item UVM is simpler and should be easy to improve over time (with more features like mm files etc.)
+%   \item Concentrate more on things that got better (not the time of operations)!
+% \end{itemize}
+
+%\comment{I want this chapter to be a guide for someone who wants to understand the Mimiker's VM design.}
+
+\section{Implementation of UVM in Mimiker}
+
+The current implementation of UVM in Mimiker isn't complete, because the old implementation that was replaced with UVM wasn't complete either.
+However, in contrast to the previous VM subsystem, the new one will be easier to extend with new features.
+Currently, only the anonymous memory mappings are available, so only the infrastructure to manage them is created so far.
+The two most important features of VM system that are missing are: paging and mapping files into memory.
+To get the first one we will need to extend the current implementation with support for backing storage, and to make it possible
+to create mappings that reflect files memory we will need to implement UVM~objects.
+Both these features will not require to change the implementation of the amaps and will require to slightly modify implementation of
+anons to allow for assigning the swap number to the anon's page.
+The other, more advanced features of UVM (e.g. page loanout and page transfer) are hard to evaluate now,
+but they will be build upon the current implementation of amaps and anons.
+
+\subsection{Structures}
+
+To describe the VM~map of the process we use standard \mintinline{c}{vm_map} and \mintinline{c}{vm_map_entry} structures.
+The only difference from UVM is that \mintinline{c}{vm_map_entry} structure has no reverence to the UVM~object, but only to the amap.
+Both these structures, presented on listings \ref{impl:vm_map} and \ref{impl:vm_map_entry}, are defined in \mintinline{c}{sys/kern/vm_map.c} \cite{mimiker:sources}.
+
+\begin{listing}[h]
+  \begin{minted}{c}
+struct vm_map {
+  TAILQ_HEAD(vm_map_list, vm_map_entry) entries;
+  size_t nentries;
+  pmap_t *pmap;
+  mtx_t mtx;
+};
+  \end{minted}
+  \caption{VM~map structure}
+  \label{impl:vm_map}
+\end{listing}
+
+\begin{listing}[h]
+  \begin{minted}{c}
+struct vm_map_entry {
+  TAILQ_ENTRY(vm_map_entry) link;
+  vm_entry_flags_t flags;
+  vm_aref_t aref;
+  vm_prot_t prot;
+  vaddr_t start;
+  vaddr_t end;
+};
+  \end{minted}
+  \caption{VM~map entry structure}
+  \label{impl:vm_map_entry}
+\end{listing}
+
+Amaps used in Mimiker are implemented using arrays.
+Whey they are created, a fixed size array is allocated to be used for anons storage.
+Such decision was made to make the implementation as simple as possible.
+The performance problem that might occur in an array implementation is not really the issue here,
+because the memory segments that appear in Mimiker are not too big and their amaps can quickly be traversed sequentially.
+
+Amaps are referenced from \mintinline{c}{vm_map_entry} structure using a small structure aref in the same way as in UVM.
+It is used to store an offset into amap, which makes it easier to split map entries without splitting or copying the amap.
+The amap structure, which is presented on listing~\ref{impl:vm_amap}, is defined in \mintinline{c}{sys/kern/vm_amap.c} and the aref,
+which is identical with the structure used in UVM, structure in \\ \mintinline{c}{include/sys/vm_amap.h} \cite{mimiker:sources}.
+
+\begin{listing}[h]
+  \begin{minted}{c}
+  struct vm_amap {
+    mtx_t mtx;             /* Amap lock. */
+    size_t slots;          /* Maximum number of slots. */
+    refcnt_t ref_cnt;      /* Number map entries using amap. */
+    vm_anon_t **anon_list; /* Pointers of used anons. */
+  };
+  \end{minted}
+  \caption{Amap structure}
+  \label{impl:vm_amap}
+\end{listing}
+
+The other difference between UVM and its Mimiker implementation is the anon structure.
+The page referenced by the anon structure can't be swapped out.
+This means that the page reference will not change during the lifetime of anon, so the page for each anon can be allocated when the anon is created.
+Later in this chapter we will sometimes identify anons wit pages (e.g. saying that the page is searched in the amap), because they are interrelated
+and knowing a page there is exactly one anon that is referencing it.
+
+The functions of anon could have been implemented by adding a reference counter to the \mintinline{c}{vm_page}.
+However, such implementation would complicate the semantics of pages, and make it less clear how it is used.
+Moreover, we hope that the UVM~objects will be implemented soon, and than having a separate structure for describing anons is mandatory.
+
+Another difference in \mintinline{c}{vm_anon} structure, compared to the UVM, is the lack of anon lock.
+Currently there is no need for such lock, because the only field that would be protected by it is the reference counter, which is currently atomic.
+The anon structure, presented on listing~\ref{impl:vm_anon}, is implemented in \mintinline{c}{include/sys/vm_amap.h} \cite{mimiker:sources}.
+
+\begin{listing}[h]
+  \begin{minted}{c}
+  struct vm_anon {
+    refcnt_t ref_cnt; /* Number of amaps referencing this anon. */
+    vm_page_t *page;  /* Page bound to the anon. */
+  };
+  \end{minted}
+  \caption{Anon structure}
+  \label{impl:vm_anon}
+\end{listing}
+
+\subsection{Operations on VM~map}
+
+In the \mintinline{c}{sys/kern/vm_map.c} file there are defined all functions that are used by the kernel to manipulate the VM~map of the process.
+Thanks to them, the implementations of individual system calls is simpler, and independent from the design of virtual memory.
+These operations are also used to modify the memory map of the process in response to actions that are not directly meant to modify memory
+(e.g. all operations on processes like \mintinline{c}{fork}, \mintinline{c}{execve} and \mintinline{c}{exit}).
+
+The most important functions:
+
+\begin{description}[style=nextline]
+  \item[{\tt void vm\_map\_new(void);}]
+    Initialize the new empty VM~map.
+    This operation is mainly used during {\tt fork} and {\tt exec}.
+
+  \item[{\tt int vm\_map\_insert(vm\_map\_t *map, vm\_map\_entry\_t *entry, vm\_flags\_t flags);}]
+    Insert new VM~map entry into existing VM~map when it is created (e.g. when {\tt mmap} system call is used).
+    By default, the VM~map entry is inserted at any address where it could fit.
+    The {\tt flags} argument may be used to change that behavior.
+    The flags that are passed to this function come from the {\tt mmap} argumets:
+    {\tt VM\_FIXED} -- specifies that the VM~map entry must be inserted at specified addresses, and
+    {\tt VM\_EXCL} -- which additionally will force unmapping of any other memory mappings that overlaps with inserted one.
+
+  \item[{\tt int vm\_map\_entry\_resize(vm\_map\_t *map, vm\_map\_entry\_t *ent, \\vaddr\_t new\_end);}]
+    This function can either extend the address range covered by given map entry or reduce it.
+    The VM~map entry can be extended when the underlying amap is big enough
+    (currently amaps cannot be extended, but they are created with few extra slots that can be used when entry is extended).
+    When the map entry is shrunk, the pages that were previously used to store data must be unmapped.
+    This function is used, for example, when the program break is moved by {\tt brk} and {\tt sbrk} system calls.
+
+  \item[{\tt vm\_map\_entry\_t *vm\_map\_find\_entry(vm\_map\_t *vm\_map, vaddr\_t vaddr);}]
+    Function that determines the VM~map entry which describes given address.
+    When no map entry is describing it, {\tt NULL} value is returned.
+
+    The lookup of the VM~map entry is very handful operation and is used by almost all functions that implement system calls actions.
+    When the requested operation is served there is usually a need to find the VM~map entry specified by the address given as an argument to the system call.
+    (E.g. when removing the mapping, we have to first find the VM~map entry that is representing the memory that will be removed.)
+
+  \item[{\tt int vm\_map\_protect(vm\_map\_t *map, vaddr\_t start, vaddr\_t end, \\vm\_prot\_t prot);}]
+    Change access protection for specified address range.
+    If part of VM~map entry must be changed, for instance because the start address is inside the memory segment,
+    then the VM~map entry is split into two individual entries, and the protection is changed only for the affected entry.
+    After updating information about access protection, it must be also updated in page table.
+    This function is used when the protection change is requested by the {\tt mprotect} call,
+    or when the new segments with the specified protection are created during the creation of a new process during {\tt exec}.
+
+  \item[{\tt int vm\_map\_destroy\_range(vm\_map\_t *map, vaddr\_t start, vaddr\_t end);}]
+    Remove all memory segments within specified range when it is requested by {\tt munmpa} system call.
+    Update page table of current process to remove address mappings that won't be valid after call to this function.
+    Similarly to the previous function, if only part of VM~map entry must be destroyed then it has to be split into two parts.
+
+  \item[{\tt void vm\_map\_delete(vm\_map\_t *vm\_map);}]
+    Destroy entire VM~map of the process after it has ended its life (e.g. after calling {\tt exit} or being terminated as a result of unhandled signal).
+
+  \item[{\tt vm\_map\_t *vm\_map\_clone(vm\_map\_t *map);}]
+    Create a new VM~map during the {\tt fork}.
+    Created VM~map is identical to the original one and shares all the VM~map entries with the old one.
+    This function also takes care about all flags that must be set to handle properly copy-on-write entries.
+
+  \item[{\tt int vm\_page\_fault(vm\_map\_t *map, vaddr\_t fault\_addr, \\vm\_prot\_t fault\_type);}]
+    Function invoked by machine dependent code, after page fault exception was generated by MMU.
+    It is responsible for finding the page that the process tried to access and inserting it into the process's page table.
+    If this is impossible, because the page doesn't exit or has a different access protection than expected,
+    it must return one of {\tt EACCES} or {\tt ENOMEM} to indicate the cause of the page fault.
+
+\end{description}
+
+The last two functions, \mintinline{c}{vm_map_clone} and \mintinline{c}{vm_page_fault}, are more complicated
+and important to understand the implementation of copy-on-write.
+They will be discussed in more details in following sections.
+
+\subsection{Operations on amaps and anons}
+
+In order to implement functions described above we need to operate on amaps and anons referenced from VM~map entries.
+All essential functions used to manage amaps and anons are defined in \mintinline{c}{sys/kern/vm_amap.c}.
+
+The most important functions:
+
+\begin{description}[style=nextline]
+  \item[{\tt vm\_aref\_t vm\_amap\_copy\_if\_needed(vm\_aref\_t aref, size\_t slots);}]
+    Make copy of amap only when it is needed.
+    This function is executed after {\tt VM\_ENT\_NEEDSCOPY} flag was discovered in VM~map entry holding that amap.
+    Amap is actually copied when it has more than one reference.
+    Such copy is done during page fault, when the new anon must be inserted into given amap.
+    If amap is still shared between multiple VM~map entries, then it is automatically copied using this function to
+    safely insert new anons into it.
+
+  \item[{\tt void vm\_amap\_remove\_pages(vm\_aref\_t aref, size\_t offset, \\ size\_t n\_slots);}]
+    Remove anons from specified slots in the amap (e.g. when memory segment is destroyed).
+    If removed anons were referenced only by the current amap, they are freed after being removed from the amap.
+    If they are referenced also by another amap, their reference count is decreased by 1.
+
+  \item[{\tt void vm\_amap\_insert\_anon(vm\_aref\_t aref, vm\_anon\_t *anon, \\ size\_t offset);}]
+    Save anon at specified offset in the amap.
+    This function fails when we try to insert anon into slot where other anon is already stored.
+    New anons are inserted into the amap when new anonymous memory is created or when they are copied after being shared as copy-on-write anons between multiple amaps.
+
+  \item[{\tt vm\_anon\_t *vm\_amap\_find\_anon(vm\_aref\_t aref, size\_t offset);}]
+    Check if amap has an anon at given offset and return its structure.
+
+  \item[{\tt vm\_anon\_t *vm\_anon\_copy(vm\_anon\_t *src);}]
+    Make a copy of given anon.
+    The new anon is allocated and the page referenced from the original one is copied to the new one.
+    Copy of the anon is needed, when anon is referenced by multiple anons but it is representing private memory.
+    After copying anon, each amap that were referencing it will have its own copy of it.
+
+\end{description}
+
+\subsection{Cloning process VM~map}
+
+The \mintinline{c}{vm_map_clone} function is responsible for making a copy of VM~map for the child process created during {\tt fork} operation.
+Each VM~map entry that is a part of VM~map must have its copy in the new map.
+Hence memory segments might be private or shared between processes, there are different rules that define how to clone them.
+
+Whole function is organized into single loop over all VM~map entries of the old VM~map.
+Each VM~map entry is examined to check its type, and using this type, proper copying function is selected.
+There are two different functions:
+
+\begin{description}[style=nextline]
+  \item[\mintinline{c}{vm_map_entry_clone_shared(vm_map_t *map, vm_map_entry_t *ent);}]
+    This function is used to copy a VM~map entry that describes shared memory.
+    New VM~map entry is identical to the original one.
+    The reference count of the amap used by both entries must be increased to record that.
+    If an amap hasn't been allocated yet, it is the last time when it can be done.
+    (If we don't allocate amap now, then none of the processes that is using these VM~map entries would be capable of allocating common amap.)
+
+  \item[\mintinline{c}{vm_map_entry_clone_copy(vm_map_t *map, vm_map_entry_t *ent);}]
+    This function is used to copy a VM~map entry that describes private memory.
+    In this case, the amap is not copied either, but both new and original VM~map entry must be updated.
+    In both entries the \mintinline{c}{VM_ENT_COW} and \mintinline{c}{VM_ENT_NEEDSCOPY} are added to flags to indicate that they represent copy-on-write segment
+    and that the amap must be copied before new pages are inserted to it.
+    The reference count in the amap is increased, because both entries will be using it unless it is copied.
+
+    Additionally, page table of the parent process must be updated, to specify that the pages of the copied segment are now read-only.
+    Proper access protection will be restored when they will be actually copied after first write fault.
+\end{description}
+
+After the new, copied VM~map entry is obtained, it is inserted into new VM~map.
+Whole \mintinline{c}{vm_map_clone} function is presented on listing~\ref{impl:vm_map_clone}.
+
+\begin{listing}[h]
+  \begin{minted}{c}
+vm_map_t *vm_map_clone(vm_map_t *map) {
+  /* ... */
+  vm_map_t *new_map = vm_map_new();
+  vm_map_entry_t *it, *new;
+  TAILQ_FOREACH (it, &map->entries, link) {
+    switch (it->flags & VM_ENT_INHERIT_MASK) {
+      case VM_ENT_SHARED:
+        new = vm_map_entry_clone_shared(map, it);
+        break;
+      case VM_ENT_PRIVATE:
+        new = vm_map_entry_clone_copy(map, it);
+        break;
+      default:
+        panic("Unrecognized vm_map_entry inheritance flag: %d",
+              it->flags & VM_ENT_INHERIT_MASK);
+    }
+    /* ... */
+    TAILQ_INSERT_TAIL(&new_map->entries, new, link);
+  }
+  return new_map;
+}
+  \end{minted}
+  \caption{The essential part of \mintinline{c}{vm_map_clone}}
+  \label{impl:vm_map_clone}
+\end{listing}
+
+%* operation made during fork \\
+%* create new vm map for the child process \\
+%* each vm map entry must be either copied to new vm map or the reference is duplicated to share the entre between processes \\
+%
+%* the main part of the copying funciton is the loop traversing all entries of the original vm map \\
+%* it is responsible for creating new vm map entry by proper function (selected based on inheritance flags) \\
+%* the new entry is then inserted into the new vm map \\
+%
+%* this is the place where the implementation changed a lot \\
+%* the vm map clone funciton is now much tidier and easier to  modify \\
+%* after changing this implementation, the copy-on-write was just a matter of modifying map cone copy function \\
+
+\subsection{Page fault handling}
+
+Second important function of VM subsystem is handling page faults.
+In Mimiker it is implemented in the \mintinline{c}{vm_page_fault} function.
+
+The operations needed to be done during page fault are different for different types of faults.
+At the beginning of the page fault routine we have to determine which scenario do we are in.
+Two main scenarios are copy-on-write and non copy-on-write fault.
+
+The copy-on-write fault happens when process is trying to write to memory which is marked as copy-on-write and still shared between two processes.
+In such case, the memory must be copied.
+
+In both cases, kernels searches for the VM~map entry that is describing the memory which is accessed by the process.
+If such map entry isn't found, the access is not valid and kernel will send {\tt SIGSEGV} signal to the user process with info that
+this is a map error (\mintinline{c}{SEGV_MAPERR}).
+When the VM~map entry is found, then it is used to search for the page that contains faulting address.
+
+%* another important operation in VM subsystem \\
+%* invoked by machine dependent code to check if memory access that failed should in fact be successful
+%
+%* heavily depends on the implementation of storage for pages \\
+%* how to determine cow or not cow case
+
+\subsubsection{Standard fault}
+
+The non-copy-on-write fault is easier to handle and is done with fewer steps:
+
+\begin{enumerate}
+  \item If amap reference doesn't exist in the VM~map entry, the amap must be created, because new page will be created and inserted into it.
+  \item Page is searched in the amap (using \mintinline{c}{vm_amap_find_anon}).
+  \item If page is not found, then it must be created.
+  \item The found or new page must be inserted into the amap and page table.
+    \begin{itemize}
+      \item If VM~map entry has \mintinline{c}{VM_ENT_COW} flag set and represents segment of memory that can be written by the process,
+        then the write access permission to the inserted page must be removed, to trigger copying of the page before first write to it.
+    \end{itemize}
+\end{enumerate}
+
+%* amap is not present -> create \\
+%* page is not found -> create \\
+%* page is found -> insert \\
+
+\subsubsection{Copy-on-write fault}
+
+The copy-on-write fault is more complicated, and there are few things kernel must carefully do.
+
+\begin{enumerate}
+  \item If VM~map entry doesn't have an amap then create one, because we will be inserting a new anon into it.
+  \item Check if amap is shared between multiple VM~map entries.
+    Use \\ \mintinline{c}{vm_amap_copy_if_needed()} to obtain new \mintinline{c}{vm_aref} that will point to the correct amap
+    (when amap is exclusive for the current VM~map entry, then the returned aref is identical to original one).
+  \item Search for the anon in the amap.
+  \item Clone the anon if it needs to be cloned.
+    \begin{itemize}
+      \item Check if anon's reference count is greater than 1 (if that's true, then the anon must be copied).
+      \item Create a new anon with a copy of the page hold by the original anon.
+      \item Replace the old anon in the amap with the reference to new one.
+    \end{itemize}
+  \item Insert new page table entry that describes the new page (using \mintinline{c}{pmap_enter}).
+\end{enumerate}
+
+
+\section{The UVM implementation process in Mimiker}
+
+Implementing new features in the existing software is always a complicated task.
+Many different parts of the codebase interact with each other and these interactions are sometimes hard to spot.
+Especially when working with a huge codebase, which is the case of working on a operating system.
+In Mimiker, it is common to modify many different subsystems while working on a single feature.
+This is because there are many things to improve, and new or improved features help find bugs in many parts of the operating system.
+
+\subsection{Changes prior to the UVM implementation}
+
+Prior to the actual change in the virtual memory implementation, a few improvements were required in the old VM subsystem and other subsystems.
+All these changes are aimed at improving the test infrastructure and the quality of tests of the virtual memory subsystem.
+These new and modified tests helped a lot later, during the transition to the UVM.
+All improvements made before this transition were implemented in the part of code that haven't been modified when implementing the UVM system.
+The implementation of system calls and virtual memory tests don't require the knowledge of the structures used to store individual pages.
+Because of that, the internal representation of structures which describe memory segments can be changed.
+
+\subsubsection{New and improved system calls}
+
+To express more operations on process memory, I had to review existing system calls to see if all the nuances of their semantics were correctly implemented.
+During that process the {\tt mmap} and {\tt munmap} were improved.
+{\tt mmap} system call was extended to support \mintinline{c}{VM_FIXED} and \mintinline{c}{VM_EXCL} flags.
+In order to do that, the function for destroying the memory range has to be updated, to make it possible to use it in that case.
+In the situation where both of these flags are set during a {\tt mmap} call, any memory that conflicts with the created memory mapping must be removed.
+This change also affected the {\tt munmap} system call, because the same procedure is used to destroy memory region specified by this system call.
+These changes were also aimed at being compliant with POSIX \cite{posix} standard.
+
+The other important system call that operates on process memory is the {\tt mprotect} call.
+The mechanism responsible for protecting memory from some accesses wasn't implemented at all.
+Even the memory created during the {\tt exec} call wasn't protected (allowing the process to write to all memory segments, even the ones that should be read-only).
+
+The ability to restrict memory accesses to parts of memory has been added gradually.
+At first, the basic functionality was implemented in the \mintinline{c}{vm_map_protect} to allow for changing protection of whole memory segments.
+At the beginning it was only used during the creation of new memory map for the process during the {\tt exec} syscall.
+
+The next natural step was to implement a fully functional {\tt mprotect} call that would allow memory protection to be changed at any time.
+The implementation of \mintinline{c}{vm_map_protect} was extended to support changing the protection of any portion of the valid memory range.
+When only a part of \mintinline{c}{vm_map_entry} needs to have the access protection changed, then the entry is split into multiple parts.
+The function fails, if some memory within specified range is not mapped.
+
+After improving the system calls or creating the new ones, the tests of virtual memory must have been updated.
+I have created new test cases for all new possible actions.
+
+\begin{samepage}
+Below I show pull requests that were created during that step:
+\begin{itemize}
+  \item \pr{1345}{[execve] Set protection bits during ELF load}
+  \item \pr{1357}{Improve memory operations}
+  \item \pr{1370}{Implement mprotect syscall}
+  \item \pr{1383}{vm: Fix prot check in vm\_page\_fault}
+\end{itemize}
+\end{samepage}
+
+\subsubsection{Improvements in signal infrastructure}
+
+The signaling infrastructure is important for the VM memory management.
+It provides a mechanism to inform the process about invalid memory operations.
+The signals were already implemented, but they only provided information about the signal number and nothing more.
+To provide more information, it was necessary to extend the implementation of the \mintinline{c}{sig_trap} function.
+This function is responsible for recording information about the signal that will later be delivered to the process.
+
+To provide additional information bound to the signal, the \mintinline{text}{ksiginfo_t} structure is filled in.
+The structure and all functions needed to operate on it, were already implemented, but it was only used to store information about the signal number.
+The important thing was to provide the additional information that will later be recorded in the \mintinline{text}{ksiginfo_t} structure.
+In the case of signals used to communicate the exception caught by the kernel to the process, this information is generated in the machine-specific trap handler code.
+Besides the {\tt SIGSEGV}, there are also other signals generated there ({\tt SIGBUS}, {\tt SIGFPE}, {\tt SIGILL} and {\tt SIGTRAP}).
+Along with all these signals, the kernel stores more detailed information about the exception that occurred in the \mintinline{c}{ksiginfo_t} structure,
+which is later translated into \mintinline{text}{siginfo_t} to be passed to the userspace signal handler.
+
+The signals mentioned above fill in the \mintinline{text}{siginfo_t} fields with following information:
+\begin{itemize}
+  \item \mintinline{c}{si_addr} -- address of memory location or the instruction that triggered the signal
+  \item \mintinline{c}{si_code} -- detailed information about the type of operation that caused the fault
+\end{itemize}
+
+In case of {\tt SIGSEGV} the \mintinline{c}{si_addr} points to the address that was accessed by the process and the \mintinline{c}{si_code}
+tells the type of memory fault: \mintinline{c}{MAP_ERROR} -- accessed memory was unmapped, \mintinline{c}{ACC_ERR} -- memory was protected from requested access.
+
+These improvements were introduced in pull request: \pr{1363}{Save additional information to signals}.
+
+\subsubsection{Improvements in testing infrastructure}
+
+The testing infrastructure is an important part of the system implementation.
+It allows to quickly discover errors in newly implemented features or in the redesigned code.
+With new actions available through system calls and more detailed information in signals, it was possible to implement new tests and improve the old ones.
+
+The most important improvement was the introduction of macros that help to define parts of tests that expect to receive a signal due to a forbidden action.
+Before that, it was really hard to create a test that checks if an action will fail with a given signal.
+It was also impossible to test more than one such action per test, because the signal was checked after the whole test failed.
+
+By introducing a new method of validating signals, new tests have become possible.
+Now we can check if a fragment of code causes a signal, and verify that all the information delivered with it matches our expectations.
+I have created a macro \mintinline{c}{EXPECT_SIGNAL} which defines which signal is expected to be received while executing instructions in the next code block.
+Under the hood, this macro sets up a signal handler to record if the signal was caught, and if caught,
+then saves the \mintinline{text}{siginfo_t} structure associated with it.
+Immediately after using the \mintinline{c}{EXPECT_SIGNAL}, the signal handler used internally by it, must be cleared using \mintinline{c}{CLEANUP_SIGNAL}.
+
+After successfully capturing the signal, the recorded \mintinline{text}{siginfo_t} structure should be tested for expected values.
+Each signal has its own macro defined, to check appropriate fields in that structure.
+In the case of {\tt SIGSEGV} the \mintinline{c}{CHECK_SIGSEGV} macro is used.
+All these macros are described in the \mintinline{c}{bin/utest/util.h} header in the source code \cite{mimiker:sources}.
+
+That new construct was added into testing infrastructure in \\
+\pr{1364}{Use sigaction in all tests that need to handle SIGSEGV}.
+
+On listings \ref{impl:segv_accerr_test} and \ref{impl:segv_maperr_test} there are two code snippets,
+that test if the code inside the \mintinline{c}{EXPECT_SIGNAL} block causes the \mintinline{c}{SIGSEGV} with correct
+\mintinline{c}{si_addr} and \mintinline{c}{si_code} recorded in the \mintinline{text}{siginfo_t} structure.
+
+\begin{listing}[h]
+  \begin{minted}{c}
+siginfo_t si;
+EXPECT_SIGNAL(SIGSEGV, &si) {
+  /* The memory pointed by ptr is read protected.
+   * This operation should raise SIGSEGV. */
+  (void)(*ptr == 0);
+}
+CLEANUP_SIGNAL();
+CHECK_SIGSEGV(&si, ptr, SEGV_ACCERR);
+  \end{minted}
+  \caption{Testing if memory read is truly forbidden.}
+  \label{impl:segv_accerr_test}
+\end{listing}
+
+\begin{listing}[h]
+  \begin{minted}{c}
+siginfo_t si;
+EXPECT_SIGNAL(SIGSEGV, &si) {
+  /* The memory at addr + 0x2000 is not mapped.
+   * This operation should raise SIGSEGV. */
+  int data = *((volatile int *)(addr + 0x2000));
+  (void)data;
+}
+CLEANUP_SIGNAL();
+CHECK_SIGSEGV(&si, addr + 0x2000, SEGV_MAPERR);
+  \end{minted}
+  \caption{Test with access to unmapped memory}
+  \label{impl:segv_maperr_test}
+\end{listing}
+
+\subsection{Transition to UVM}
+
+After all preliminary work has been done we were able to change the implementation of the VM subsystem.
+In fact the change was intended to be as small as possible and to simplify the whole VM implementation a lot.
+It was achieved by removing two old structures (VM objects and pagers) and introducing one new structure (VM amap).
+It was possible, because VM objects and pagers were used only to represent anonymous memory mappings without any additional features.
+Thanks to that all required operations made on memory segments were possible to implement with just an amap.
+Moreover, there was no need to implement anons at that moment, because without copy-on-write support all memory pages were eagerly copied during the fork,
+so each page could be owned only by one amap at the time.
+Because there wasn't introduced any new functionality, the new VM subsystem could be tested with the old tests.
+
+The transition to UVM based virtual memory was made in \\ \pr{1379}{[vm] Simplify virtual memory subsystem}.
+
+\subsection{Implementation of copy-on-write}
+
+When the new VM subsystem was ready, we could finally start implementing the copy-on-write mechanism.
+Thanks to the previous improvements in the VM subsystem the change was easier to create.
+In this stage, the implementation of amaps was extended to make it possible to represent pages with anons which could shared between multiple amaps.
+
+The changes that were made to create copy-on-write mechanism were done in two places: in {\tt fork} implementation and in page fault routine.
+Changes made to the \mintinline{c}{vm_map_clone} function, invoked during {\tt fork}, were rather simple.
+The old, eager copying of the whole VM~map was removed and instead only the flags of the VM~map entries are modified.
+Whole memory is shared right after the child process is created and the private memory segments are marked as copy-on-write to be copied later.
+
+More complicated changes were done in the page fault handler implementation in the \mintinline{c}{vm_page_fault} function.
+Because now this function has to determine if the memory has to be copied, it has to handle a few new cases.
+It has to carefully check the flags and reference counters of the amaps and anons to determine if they have to be copied.
+Moreover, it must also adjust the permissions that are used when the found page is inserted into the process page table.
+
+All the steps that are done in the \mintinline{c}{vm_page_fault} function:
+
+\begin{enumerate}
+  \item Create the amap if current VM~map entry doesn't have one.
+  \item Search for anon in the current amap.
+  \item If entry is marked as copy-on-write (call \mintinline{c}{cow_page_fault}):
+    \begin{enumerate}
+      \item Check if amap needs to be copied and copy it
+        (it is done when \\ \mintinline{c}{VM_ENT_NEEDSCOPY} is set and amap is referenced by more than one VM~map entry).
+      \item Check if anon needs to be copied and copy it (it is done when anon is referenced by multiple amaps).
+    \end{enumerate}
+  \item Insert anon with new (or found) page into current amap (if it isn't already there).
+  \item Insert the page referenced by the found anon into the page table with correct access protection.
+\end{enumerate}
+
+
+%* changes in two places:
+%  * fork -- rather simple change. removed copying in favour of setting few flags
+%  * page fault -- some new, complicated logic
+%    * few new cases (memory could be shared, partially copied or entirely copied)
+%    * all of these cases must be properly identified and handled
+%    * changed how amaps are copied
+
+When working on that change, also the old tests were used unmodified because from process perspective nothing should change.
+The internal design of the VM should not affect how it is exposed to user processes.
+
+% * also the old tests were used, because processes should not notice any change, because that is only internal representation of
+
+Copy-on-write was implemented in \pr{1392}{vm: Copy on write}.
+
+\subsection{Further work}
+
+The implementation described in this chapter is not complete.
+Some of the features of UVM that are supported in the NetBSD system are not yet created in Mimiker.
+To support them other subsystems in Mimiker must be reviewed and improved.
+For instance, to implement memory mapped files we would have to improve the VFS (Virtual File System) because the main structure defined there,
+\mintinline{c}{vnode_t}, will be used by UVM~objects to fetch data from the file system and place it in the process memory.
+Similarly, to allow pages to be swapped to secondary storage,
+we would need to ensure that we could easily interact with block devices and use them to store pages that are not currently in use.

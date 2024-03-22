@@ -1,0 +1,339 @@
+\chapter{Introduction}
+\label{chapter:introduction}
+
+Mimiker is a UNIX operating system inspired by systems from the BSD family.
+It is used to teach about UNIX kernel design so it has to implement the most important mechanisms of such a kernel
+while still being simple and possible to understand.
+One of the most important part of the kernel is the {\it Virtual Memory subsystem (VM)},
+which is responsible for managing memory available in the system and providing it to the processes started by users.
+Virtual Memory subsystem consists of various mechanisms that effectively manage memory.
+
+The main goal of this thesis is to implement a copy-on-write mechanism in Mimiker.
+It is the mechanism which reduces the amount of memory used by processes and speeds up the creation of them.
+To measure if that objectives are met I've also created a tool for measuring performance of the kernel.
+Additionally, while working on the copy-on-write mechanism I have improved the overall implementation of Virtual Memory in Mimiker,
+both in terms of performance and functionality.
+
+In the rest of this chapter we will see how processes use the memory and what operations should be implemented by the operating system kernel.
+Our implementation of VM should provide all these operations.\footnote{
+  In fact some of the features described below are not implemented in Mimiker yet.
+  They require improvements or new types of operations in subsystems other than the virtual memory.
+  The work described in this thesis does not cover this, but the new implementation of the VM is ready
+  to be extended with the missing features as soon as all the necessary kernel mechanisms are ready to support them.
+}
+The copy-on-write, as it is a optimization, should not change the semantics of those operations.
+
+%\begin{itemize}
+%  \item We have a basic implementation of VM in Mimiker.
+%  \item Based on the implementation from FreeBSD
+%  \item We want to keep the semantics of system calls (and improve it to match the POSIX specification)
+%  \item We want to change only the internal implementation
+%  \item We want to improve it:
+%    \begin{itemize}
+%      \item Save memory by sharing it between processes when it is possible (CoW)
+%      \item Speed up fork
+%      \item Simplify the implementation of VM to make it easier to extend with new features
+%      \item Create a tool to verify if the new implementation performs well
+%    \end{itemize}
+%  \item To understand how
+%\end{itemize}
+
+\section{Process virtual memory}
+
+In operating systems, which support virtual memory, each user processes has its own {\it virtual address space}.
+The process has an illusion, that it has all memory available only to itself.
+To maintain this abstraction, the OS kernel has to carefully allocate real (physical) memory to store processes' data.
+The whole layout of the process virtual memory is described in a {\it virtual memory map}.
+It also contains information how to find the real location of the process memory.
+
+The memory of the process is logically divided into segments.
+The {\it memory segment} is a contiguous part of the process memory which has the same attributes.
+There are few attributes that can describe different segment types:
+\begin{itemize}
+  \item Access protection -- process might be able to perform only few operations on the memory (read, write or execute).
+  \item Source of the memory -- memory may come from a file, device registered in the system or might be created without any data.
+  \item Visibility -- segment might be private for the process or shared between multiple processes.
+\end{itemize}
+
+%For each user process, the kernel creates and manages a separate virtual address space.
+%It creates a {\it virtual memory map} to describe all the memory used by the process.
+%It consists of many segments which representing regions of memory with the same properties.
+%The segments don't have to describe contiguous memory and usually there are regions of unmapped memory between used segments.
+%
+%Besides VM~map, each process has its own page table to store its mappings from virtual to physical addresses.
+%MMU uses it to perform address translation when that process is running.
+%
+%These structures sometimes may be confused with each other while being used for different things.
+%VM~map completely describes the memory of the process, and has always the most recent information about all memory segments.
+%The page table keeps track of currently used pages and is updated over time with new and changed address mappings.
+%This difference is most noticeable when the process starts.
+%Its VM~map has entries that describe its code, data and stack, but page table is empty because there wasn't made any memory access yet.
+
+\subsubsection{Typical memory map}
+
+The user process in Mimiker OS usually has at least six typical memory segments.
+The table~\ref{tab:vm_map} describes these segments with their address ranges and access permissions.
+Programs in real operating systems often have more memory segments in their memory map
+(e.g. the heap or segments containing shared libraries data).
+
+In Mimiker, the layout of the memory map is deterministic.
+The first segment starts at 0x400000, and the next segments are placed directly after the previous one
+(except for sbrk and stack, which are placed at other hard-coded addresses).
+In more advanced operating systems, the layout of the address space is randomized.
+This makes it harder to predict the addresses that will be used during program execution
+(it prevents some types of attacks on the running software).
+This technique is called {\it address space layout randomization (ASLR)} \cite{tannenbaum}.
+
+\begin{table}[b]
+  \centering
+  \begin{tabular}{|c|c|c|c|}
+    \hline
+    \mintinline{c}{segment} & \mintinline{c}{start}      & \mintinline{c}{end}       & \mintinline{c}{prot}         \\
+    \hline
+    \mintinline{c}{code}   & \mintinline{c}{0x400000}       & \mintinline{c}{0x42e000}       & \mintinline{c}{READ | EXEC}         \\
+    \mintinline{c}{data}   & \mintinline{c}{0x42e000}       & \mintinline{c}{0x431000}       & \mintinline{c}{READ | WRITE}        \\
+    \mintinline{c}{rodata} & \mintinline{c}{0x431000}       & \mintinline{c}{0x439000}       & \mintinline{c}{READ}                \\
+    \mintinline{c}{bss}    & \mintinline{c}{0x439000}       & \mintinline{c}{0x43e000}       & \mintinline{c}{READ | WRITE}        \\
+    \mintinline{c}{sbrk}   & \mintinline{c}{0x8000000}      & \mintinline{c}{0x8003000}      & \mintinline{c}{READ | WRITE}        \\
+    \mintinline{c}{stack}  & \mintinline{c}{0x7fffff7f0000} & \mintinline{c}{0x7fffffff0000} & \mintinline{c}{READ | WRITE | EXEC} \\
+    \hline
+  \end{tabular}
+  \caption{Typical process VM~map in the Mimiker OS}
+  \label{tab:vm_map}
+\end{table}
+
+In addition, the process address space also contains the kernel memory (which is not visible in the process VM~map).
+It is located at high addresses and is protected from any access by the user program.
+The kernel code and data must be visible in any address space because the kernel must be able to operate in any context.
+Therefore, during context switching, when the address space is replaced with another process address space,
+the kernel portion of memory remains unchanged.
+
+On the other hand, the kernel must be able to modify process memory.
+When a process requests some action from the kernel (using a system call interface), it is usually associated
+with data movement (either from user to kernel or vice versa).
+For example, during the \mintinline{c}{read} and \mintinline{c}{write} system calls, the process provides a buffer that is located in its memory.
+Then, the kernel reads the data from that buffer (and writes it to the file referenced by the file descriptor),
+or writes the data fetched from the file to that buffer.
+
+\subsection{Types of memory segments}
+
+There are several types of memory segments that are used by the processes for different purposes.
+They can be categorized by two attributes: the type of memory they represent,
+and the way they are shared between multiple processes.
+
+\begin{description}[style=nextline]
+  \item[Memory mapped file segments]
+    Such segments contain data from a file stored in the file system mounted in the OS.
+    We can specify whether changes made to their memory should also be written to the file or not.
+    Segments representing file memory may also be swapped out using the file system, if possible.
+
+    (Resources other than files that are available in the operating system may also be visible as memory in the process's memory map.
+    Normally, all resources in UNIX systems are represented as files, so this case can also be called a memory mapped file).
+
+  \item[Anonymous memory segments]
+    The anonymous segments do not contain data associated with any resource present in the OS.
+    They are initially filled with zeros because there is no place to read their contents from.
+    Such segments are always swapped out to the swap space on a disk.
+    After such a segment is destroyed, its data is lost and is not written to any file or other resource.
+
+  \item[Private memory segments]
+    They are visible only to the process that owns them.
+    This means that the process has a private copy of the memory represented by such segments.
+    Any operations performed on it will only be noticed by that process and no other.
+
+    In the case of a privately mapped file, its contents are read from the file system,
+    but any modifications are made to the process' copy of it.
+    Private segments are usually swapped out using swap space on disk
+    (the only exception to this rule is a situation when the segment read from the file hasn't been modified yet).
+    After they are destroyed, their memory isn't saved anywhere.
+
+  \item[Shared memory segments]
+    Shared segments represent memory that is shared by multiple processes.
+    Memory may be shared directly between processes if the same segment is present in multiple memory maps.
+    Such a configuration can be obtained by creating a fork of a process that has a memory segment marked as shared.
+
+    The other way is to share memory through the file system.
+    When a file is mapped to process memory as shared, all write operations to the memory are also reflected by the file system,
+    making them visible to other processes.
+    Only files can be shared this way.
+
+\end{description}
+
+Different types of segments are used for different tasks.
+Mapping file into the process memory is a convenient way to make faster I/O operations. % XXX: Are you sure about it???
+The anonymous segments can be used as an inter-process communication method.
+The memory mapping details are described in 9.8 in \cite{csapp} or in the \mintinline{c}{mmap} system call manual \cite{man:freebsd}.
+
+\subsection{System calls related to the process VM}
+
+There are several operations that can modify the process memory map.
+They fall into two categories:
+\begin{itemize}
+  \item Modify the VM~map directly: \mintinline{c}{mmap}, \mintinline{c}{munmap}, \mintinline{c}{mprotect}.
+  \item Change the VM~map as a result of another action: \mintinline{c}{fork}, \mintinline{c}{execve}, \mintinline{c}{exit}.
+\end{itemize}
+
+Besides the above system calls there are other which operate on the process memory map.
+The ones that I mention here are implemented in all UNIX systems, also in Mimiker OS,
+because they provide basic functionality needed to manage process virtual memory.
+
+\begin{description}[style=nextline]
+  \item[\mintinline{c}{void *mmap(void address, size_t len, int prot, int flags, int fd, off_t offset);}]
+    The \mintinline{c}{mmap} function is used to allocate a new memory segment  of the specified size (\mintinline{c}{lenght}).
+
+    The \mintinline{c}{address} argument is used as a hint for the kernel, where to place the created mapping in the process's
+    memory map.
+    If this is impossible, the kernel will choose another location for the new segment.
+    This behavior might be modified by \mintinline{c}{MAP_FIXED} flag which tells the kernel that the location of the new segment
+    must exactly as specified.
+    Additionally, by adding one more flag (\mintinline{c}{MAP_EXCL}) we could ask kernel to fail if there exists
+    any mapping within requested range.
+
+    The \mintinline{c}{prot} argument specifies the types of memory operations that will be possible on the new memory
+    (\mintinline{c}{PROT_EXEC}, \mintinline{c}{PROT_READ}, \mintinline{c}{PROT_WRITE}, \mintinline{c}{PROT_NONE}).
+
+    The \mintinline{c}{flags} arguments determine the type of segment and specify the detailed behavior of the \mintinline{c}{mmap} function
+    (\mintinline{c}{MAP_SHARED}, \mintinline{c}{MAP_PRIVATE}, \mintinline{c}{MAP_ANONYMOUS}, \mintinline{c}{MAP_EXCL}).
+
+    The \mintinline{c}{fd} and \mintinline{c}{offset} arguments are used to specify the file and the offset in the file,
+    where the mapping will begin.
+
+  \item[\mintinline{c}{int munmap(void address, size_t length);}]
+    \mintinline{c}{munmap} function is used to free the specified fragment of the memory (determined using the starting
+    \mintinline{c}{address} and the \mintinline{c}{length}).
+    The released memory doesn't have to to be represented by a single segment
+    (e.g. it can belong to two adjacent segments) or to have the same properties.
+
+  \item[\mintinline{c}{int mprotect(void addr, size_t len, int prot);}]
+    The \mintinline{c}{mprotect} system call is used to change the access protection of the existing memory region.
+    The modified memory region doesn't have to be within a single segment (similar to \mintinline{c}{munmap}).
+
+    The protection is only changed in the memory map of the process that called \mintinline{c}{mprotect}.
+    Each process sharing the segment affected by this call uses its own protection flags
+    (so one process may have mapped the segment as read-only,
+    but the other may write to the memory described by that segment).
+
+  \item[\mintinline{c}{pid_t fork(void);}]
+    \mintinline{c}{fork} creates an identical copy of the calling process.
+    The new process is called a {\it child}, while the original is a {\it parent}.
+    If \mintinline{c}{fork} succeeds, it returns twice (in the parent with the pid of the child and in the child with the value of 0).
+
+    The child's VM~map is identical to the parent's VM map.
+    Each private memory segment must be copied, and the shared memory is now also shared between the parent and the child.
+
+  \item[\mintinline{c}{int execve(const char *pathname, char *argv[], char *envp[]);}]
+    \mintinline{c}{execve} is used to start the execution of a new binary, without creating a new process.
+    Combined with \mintinline{c}{fork}, these two operations are used to start new programs.
+
+    The path to the binary file is specified with \mintinline{c}{pathname}.
+    The new process is started with the arguments passed by the \mintinline{c}{argv} argument
+    and with the environment passed by the \mintinline{c}{envp} argument.
+
+    During \mintinline{c}{execve} the whole memory map of the calling process is destroyed and a new one is created.
+    In the new VM~map  new segments are created for the code and data read from the program binary file.
+    It also allocates a segments that are not related to data read from the file (e.g.stack and sbrk).
+
+  \item[\mintinline{c}{void exit(int status);}]
+    The \mintinline{c}{exit} function is called to terminate the process.
+    The value \mintinline{c}{status} passed to this function is returned as the return code of the process.
+
+    When a process is terminated, all kernel structures used to describe that process must be freed.
+    One of the process resources that is destroyed is the process memory map.
+
+\end{description}
+
+All these operations on the memory segments are well described in the chapter "Memory mappings" in \cite{kerrisk}.
+There are also entire chapters dedicated to process management in \cite{kerrisk} and \cite{apue}.
+
+Because Mimiker is still an immature operating system, some of these system calls are not fully supported.
+There are some features, like mapping files into process memory, that can't be implemented because currently there are no kernel mechanisms to support them.
+Improvements in these system calls is also the part of this thesis.
+My work has introduced a \mintinline{c}{mprotect} system call,
+implemented \mintinline{c}{mmap} semantics when \mintinline{c}{MAP_FIXED} is used and improved fork with copy-on-write mechanism.
+
+\subsection{Memory faults}
+
+Memory accesses triggered by a process may also fail.
+There are two reasons why an operation on memory fails:
+\begin{itemize}
+  \item Accessed memory is unmapped (e.g. the address used to access memory wasn't calculated properly or memory wasn't allocated).
+  \item Process has wrong access rights to requested memory (e.g. tries to write to the read-only memory region).
+\end{itemize}
+To inform the user process about such faulting access Kernel delivers a {\tt SIGSEGV} signal to it.
+
+UNIX signals are used to inform processes about synchronous or asynchronous events that happened while they are executing.
+{\tt SIGSEGV} is one of them, used to notify about wrong memory accesses.
+When process receives a signal it must take some action before continuing to execute its original code.
+Default actions are usually to ignore a signal or to terminate a process, but the action performed on signal delivery can be
+adjusted (process may register an arbitrary function as a {\it signal handler}).
+Signals also convey additional information, which can be obtained in a signal handler via the \mintinline{text}{siginfo_t} structure.
+
+{\tt SIGSEGV} contains additional information about the fault type (whether it was caused by access to unmapped region or by access violation) and
+the address which caused the fault.
+Thanks to that, process which receives an information about memory fault can handle that situation (for instance by allocating memory which was unmapped).
+
+The implementation of signals are usually specific for given operating system.
+There may exist small differences in the way how signals are delivered, generated or handled.
+The details of usage of the signal infrastructure can be found in user manuals of the system \cite{man:freebsd, man:linux, man:netbsd}.
+Signals are one of the fundamental concepts in UNIX operating systems so they are described in almost every programmer handbook \cite{kerrisk, apue, vahalia}.
+
+\section{Copy-on-write mechanism}
+
+{\it Copy-on-write (CoW)} mechanism improves the performance of \mintinline{c}{fork} system call by reducing the number of memory copies that have to be made.
+By default, without using CoW, during \mintinline{c}{fork} all private memory of the parent process must be copied and inserted into child's VM~map.
+This is done even if child process uses \mintinline{c}{execve} immediately after being created without modifying the memory.
+We can observe, that in such case it could have used the original memory of the parent process unless parent process had modified it.
+
+In some systems there is dedicated system call for that case -- \mintinline{c}{vfork}.
+When it is called, the parent process is suspended until child calls \mintinline{c}{execve} or exits.
+The child process is very restricted right after being created, because it is using exactly the memory of the parent process
+(it can't modify it or call different functions than the function that called \mintinline{c}{vfork}).
+
+In addition to that, there also exists a \mintinline{c}{clone} system call that provides more control over the resources shared between parent and child processes.
+It can be used to specify if processes will share the same memory, or if \mintinline{c}{clone} should behave like a~\mintinline{c}{vfork}.
+
+\mintinline{c}{vfork} solves only a few problems of process cloning, but have also many limitations.
+There are situations when a {\tt fork} with Copy-on-write is better:
+\begin{itemize}
+  \item Child needs to adjust its configuration before calling {\tt execve} -- {\tt fork} with CoW allows the child process to modify its memory.\\
+    Example:
+    \begin{itemize}
+      \item Shell -- every command requested by the user is executed in a process created with {\tt fork}.
+        Before executing the program shell usually needs to adjust the process parameters (e.g. redirect output to file).
+    \end{itemize}
+  \item We want a parent process to execute immediately after {\tt fork} -- {\tt fork} with CoW doesn't suspend the parent, but it can execute
+    right after the child process is created.\\
+    Example:
+    \begin{itemize}
+      \item HTTP server -- if every request is handled by a new process created with {\tt fork} then the parent process should be able
+        to accept new connections without waiting for the child that was delegated to handle previous connection.
+    \end{itemize}
+  \item Parent and child execute the same program -- they can still share private parts of their memory,
+    which are not modified by none of them, but not explicitly marked as shared. \\
+    Example:
+    \begin{itemize}
+      \item Any process which runs multiple threads -- there are a few segments that are usually not modified (e.g. program code or rodata section).
+        Additionally, if a program setups some memory during a startup (e.g. the configuration read form the file) then it will be also shared unless it's modified.
+    \end{itemize}
+\end{itemize}
+
+When system implements copy-on-write mechanism during {\tt fork}, the memory of the processes will not be cloned immediately,
+but shared between parent and child as long as it is possible.
+The VM~map and page table are copied but they reference original pages used initially only by the parent.
+However, to preserve semantics of {\tt fork} the memory cannot be shared forever.
+There are segments of memory that should be private for the process and they shouldn't be modified by other processes,
+nor the changes made by the process shouldn't be observed by other processes.
+To ensure this, the operating system kernel must mark the temporarily shared segments as read-only segments to prevent processes from writing to them.
+When a process tries to write data to the memory in such segment,
+it triggers a page fault and kernel can make a private copy of that page for the process which writes the memory.
+This way, only the pages that have been modified are copied on demand.
+
+\section{Next chapters}
+
+In next chapters we will see the details of Virtual memory design (chapter~\ref{chapter:vm_overview}) and the most important aspects
+of the VM implementation in systems from the BSD family (chapter~\ref{chapter:details}).
+Later I will present the Mimiker's Virtual Memory subsystem (chapter~\ref{chapter:mimiker}).
+That chapter will be a guide for future Mimiker developers willing to work on the implementation of VM.
+The following chapter ({\ref{chapter:performance}), is dedicated to the Kernel Function Trace tool, that is used to measure the performance of the implementation
+created in this thesis.
+In the end, I will conclude what has been done in Mimiker and what are the possible next steps to improve Virtual Memory subsystem in Mimiker.

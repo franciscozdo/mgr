@@ -1,0 +1,456 @@
+\chapter{Performance}
+\label{chapter:performance}
+
+In this chapter we will compare two implementations of virtual memory subsystem in Mimiker, the old one and the one based on UVM.
+Additionally, this chapter contains a description of a tool created to collect data for this comparison (KFT).
+
+\section{Kernel Function Trace}
+
+{\it Kernel Function Trace (KFT)} is a tool for obtaining trace of all functions used by the Mimiker kernel during execution.
+The main idea behind KFT comes from the Linux tool {\tt ftrace} \cite{ftrace}.
+However, since Mimiker is significantly different from Linux, the design of such tool had to be reinvented and adjusted for our needs.
+
+The high-level idea behind the KFT is to record what functions were executed by the kernel while running the system.
+When KFT is enabled in the build system, additional instrumentation is compiled into the Mimiker executable.
+When Mimiker is launched, the information collected by the KFT can be read by the debugger.
+By default, when launching Mimiker with enabled KFT, that information is saved in {\tt dump.kft} file.
+Afterwards, the KFT dump must analyzed with dedicated software which is capable of parsing the KFT format used to save events recorded during the kernel execution.
+I have created a Python library that can be used to design scripts to analyze KFT dumps, but it is also possible to use different language because the format
+of saved data is independent from the programming language.
+
+\subsection{The design of KFT}
+
+\subsubsection{Function instrumentation}
+
+To track function execution in the Mimiker kernel, additional instrumentation must be added to most kernel functions.
+KFT is enabled in {\tt config.mk}, the main configuration file for the project,
+by setting {\tt KFI} (Kernel Function Instrumentation) flag to {\tt ftrace} ({\tt KFI=ftrace}).
+When KFT is enabled the {\tt -finstrument-functions} flag is appended to the compiler flags.
+It tells the compiler to add additional code to each kernel function.
+We define two functions, \mintinline{c}{__cyg_profile_func_enter} and \mintinline{c}{__cyg_profile_func_exit}, which are executed before and after each instrumented functions.
+They allow us to record the time of entry and exit for each function.
+
+By default all kernel functions are instrumented, but not all of them should.
+Executing additional steps before some critical functions may drastically slow down the execution of the system or cause other more complicated problems
+(e.g. indefinite recursion when instrumented function is invoked by the code added by compiler).
+To exclude a function from instrumentation we must mark it with a \mintinline{c}{__no_profile} attribute.
+It prevents the compiler from inserting additional code around specified function.
+
+%* functions are instrumented because of use -finstrument-functions flag in the compiler
+%* dedicated functions are created \mintinline{c}{__cyg_profile_func_enter} and \mintinline{c}{__cyg_profile_func_exit}
+%* some critical functions that are executed very often are excluded from being instrumented using \mintinline{c}{__no_profile} attribute
+%* The KFT instrumentation is turned on when the flag {\tt KFI} is set to {\tt ftrace}
+
+\subsubsection{Recording events and format specification}
+
+Each entry and exit of a function is recorded as a {\it KFT event}.
+Event consists of the following information: function pc, timestamp, thread id and event type.
+All these information is saved into a single 64 bit integer by applying encoding:
+
+\begin{itemize}
+  \item[\bf bit 0      ] -- Represents event type (0 for entry, 1 for exit from a function).
+  \item[\bf bits 1--8  ] -- Represent the ID of thread that was executing given funciton.
+  \item[\bf bits 9--42 ] -- Store the timestamp (measured in number of processor ticks from the system boot, read from hardware specific register).
+  \item[\bf bits 43--63] -- Encode PC by saving the function entry address relative to \mintinline{c}{__kernel_start} symbol.
+\end{itemize}
+
+The encoded KFT event is presented on figure~\ref{fig:kft_event_encoded}.
+
+\begin{figure}[h][h]
+  \centering
+  \begin{bytefield}[bitheight=\widthof{~type~}, bitwidth=0.6em, boxformatting={\centering\small}]{64}
+    \bitheader[endianness=big]{64,42,9,1,0} \\
+    \bitbox{21}{relative PC} & % 22
+    \bitbox{33}{timestamp} & % 33
+    \bitbox{8}{thread id} & % 8
+    \bitbox{2}{\rotatebox{90}{type}} % 1
+  \end{bytefield}
+  \caption{Meaning of the bits of the encoded KFT event}
+  \label{fig:kft_event_encoded}
+\end{figure}
+
+All functions that are used to create and record KFT events are defined in \mintinline{c}{sys/kern/kftrace.c}.
+KFT events are saved to the global buffer which is allocated during the kernel init.
+After KFT is initialized events are appended to that buffer.
+When buffer is full, the \mintinline{c}{kft_flush} function is called.
+The function itself does nothing but clear the buffer by setting the number of recorded events to zero.
+To actually save the data gathered by KFT, we must use GDB debugger.
+It stops on \mintinline{c}{kft_flush} function and copies out all data saved in the buffer, before new events are recorded.
+When debugger is not attached, then all data created by KFT is discarded.
+
+%* The KFT format is defined in \mintinline{c}{sys/kern/kftrace.c} file.
+%* The two types of events are recorded: function enter and exit.
+%* We also record the timestamp and the thread where the event has happened.
+%* The PC (program counter) is used to record the function that has been entered or exited.
+%  * It is relative to the kernel start address (to make it shorter, but still easy to decode).
+%* The single event is encoded in a single 64 bit number.
+
+\subsection{Analyzing KFT dumps}
+
+After KFT dump is obtained from a single Mimiker run we can analyze it.
+I~have created a Python library, called {\tt kftlib}\footnote{\url{https://github.com/cahirwpz/mimiker/tree/master/kftlib}},
+which is capable of translating raw dump to a list of structures understood by Python.
+That library may be used to implement more complicated scripts for various analysis of the dump.
+
+\subsubsection{Details of translating KFT dump into readable format}
+
+To correctly decode information saved in KFT dump, we first need to analyze Mimiker ELF file.
+We need to extract function symbols from it and create a correspondence between function names and their addresses.
+(Recall that KFT saves only an entry address of the function.)
+I have used {\tt pyelftools} Python library \cite{pyelftools:sources} to access details of it.
+To create meaningful representation of gathered KFT data we make few transformations of raw data:
+\begin{enumerate}
+  \item Decode each entry -- we need to transform single 64 bit integer to values describing single KFT event.
+    We use the same scheme as presented in previous section.
+    Additionally, to translate relative PC into real PC we use the location of \mintinline{c}{__kernel_start} symbol read from the ELF file.
+  \item Assign events to different threads -- we use the thread number associated with an event to distribute events between threads.
+  \item Calculate timestamps within threads -- for each thread we create separate timeline, which starts when the thread was created.
+    We need to adjust timestamps of functions withing single thread, because they are not correct when thread was preempted by another one.
+    We can observe when context switches happened (its when the thread identifier changes between two consecutive events).
+    Using that information we can calculate the timestamps for events withing single thread.
+\end{enumerate}
+
+As a result of those transformations we obtain separate traces for each thread that was running during the kernel execution.
+Each event contains information about its type, PC of the function and the timestamp.
+In this representation, timestamp represents number of ticks that passed from the creation of the thread, but only when this thread was running.
+
+Using such representation we can now do more transformations to get some valuable information out of it.
+Examples of different information that we can extract from KFT dump:
+
+\begin{itemize}
+  \item Count how many times function was invoked by calculating number of entry events.
+  \item Calculate running time of the function by determining entry and exit events and calculating the difference between their timestamps.
+  \item Create call graph representing how next functions were invoked (example presented on figure~\ref{fig:call_graph}).
+\end{itemize}
+
+\begin{figure}[h]
+  \centering
+  \begin{minted}{text}
+         time  function
+          ---  ----
+            0  vm_map_clone
+           88  | vm_map_new
+          803  | | vm_map_setup
+         1062  | | *
+         1149  | | pmap_new
+         4868  | | *
+         4954  | *
+         5079  | vm_map_entry_clone_copy
+         5162  | | vm_map_entry_copy
+         5246  | | | vm_map_entry_alloc
+         6068  | | | *
+         6153  | | *
+         6241  | | vm_amap_hold
+         6494  | | *
+         6590  | | pmap_protect
+        24930  | *
+               (...)
+        49747  *
+  \end{minted}
+  \caption{Fragment of a call graph generated for \mintinline{c}{vm_map_clone} function}
+  \label{fig:call_graph}
+\end{figure}
+
+I have chosen to create a python library instead of single script for analyzing KFT dumps because I think it is more flexible solution.
+Every analysis, can be expressed with a single script which is easier to create, read and maintain.
+At the end of this chapter, on listing~\ref{impl:kft_script}, I present an example script, which was used for generating data used in next section to create graphs.
+
+%* analyzing kft dumps \\
+%  * prepared python library that implements parsing of the dumps \\
+%  * library can be used to parse the kft dump \\
+%  * creates easier to process representation of all entries \\
+%    * trace is split into individual threads \\
+%    * timestamps are corrected (taking into account context switches) \\
+%    * individual trace for each thread that was running \\
+%  * using the structure created by kftlib user can write his own script \\
+%    * more flexible tool
+%
+%* explain the timestamps (why we don't care about exact time, only the number of ticks)
+
+\subsection{Performance of the new VM subsystem}
+
+The performance of the new UVM subsystem with implemented copy-on-write feature is measured on the Mimiker's tests execution.
+I am comparing two versions of Mimiker:
+
+\begin{description}
+  \item[New]
+    The newest version of Mimiker with all new features and optimizations.
+    \footnote{At the time of writing this thesis the latest commit is
+    \href{https://github.com/cahirwpz/mimiker/commit/3dffeafce8dbba33741505163d7856dbc0f1dd36}{\tt 3dffeafce8}}
+  \item[Old]
+    The version with old implementation of virtual memory subsystem.
+    It is tracked by the branch {\tt old-vm-master}\footnote{\url{https://github.com/cahirwpz/mimiker/tree/old-vm-master}}.
+    To accurately compare those two versions, all changes made to the kernel and not related to the transition to UVM were applied to the old version too.
+\end{description}
+
+Below I show a few histograms and all of them show the same data for different functions.
+There are two types of plots that we will see there:
+\begin{itemize}
+  \item Bar plots -- they present the difference in the number of function calls for given functions.
+  \item Histograms -- they present a distribution of running times for given functions.
+    On the x-axis there is an execution time and on the y-axis there is a number of invocations that ran for a given time.
+\end{itemize}
+
+\subsubsection{Comparison between old VM and UVM with copy-on-write}
+
+One of the main goals of this thesis was to implement copy-on-write mechanism which reduces number of page copies.
+Thanks to the new virtual memory mechanism we copy only pages that really needs to be duplicated.
+On figure~\ref{plot:pmap_copy_page} we can see that \mintinline{c}{pmap_copy_page} function, which is used by the kernel
+to make a copy of given page, is used almost 13 times less than before.
+
+\begin{figure}[h]
+  \centering
+  \createbar{9652}{700}
+  \caption{The number of \mintinline{c}{pmap_copy_page} invocations}
+  \label{plot:pmap_copy_page}
+\end{figure}
+
+The other results, which emerges from the fact that we now make much less copies of pages, is that we also use less pages in total.
+On the figure~\ref{plot:vm_page_alloc} we can see, that we use about 5 times less pages than previously.
+In Mimiker all pages have size 4 KB, hence the space saved thanks to copy-on-write is about 4 MB.
+
+\begin{figure}[h]
+  \centering
+  \createbar{10822}{1870}
+  \caption{\mintinline{c}{vm_page_alloc}}
+  \label{plot:vm_page_alloc}
+\end{figure}
+
+Because all page copies are now performed on demand and not in the \mintinline{c}{vm_map_clone}, that function is much faster now.
+All invocations of \mintinline{c}{vm_map_clone} are now almost 2 times faster than all invocations of the same function in the old implementation.
+The comparison of two implementations of this function is presented on histogram on figure~\ref{histogram:vm_map_clone}.
+Those results show, that after {\tt fork} both parent and child processes will start executing faster,
+because they don't have to wait until all parent memory is duplicated.
+
+\begin{figure}[h]
+  \centering
+  \createhist{plots/data-old/vm_map_clone.data}{plots/data-new/vm_map_clone.data}{xmin=0, xmax=130000, legend style={at={(0.02,0.89)},anchor=west}}
+  \caption{\mintinline{c}{vm_map_clone}}
+  \label{histogram:vm_map_clone}
+\end{figure}
+
+The other important function that we care about is \mintinline{c}{vm_page_fault}.
+Execution time of page fault handling routine as well as the number of page faults has increased.
+Both these results are expected.
+The time has increased, because page copies are now performed here instead of during fork.
+The number of page faults has increased, because copy-on-write segments generate now additional page faults.
+Parent process will generate one additional page fault when it will try to write to copy-on-write segment.
+Child process may generate two page faults on the same memory when it accesses such segment first with read operation and later with write operation.
+In the original implementation child generated only one page fault, and parent didn't generate any page fault at all,
+because its memory was always present and ready to be access with any allowed operation.
+
+On the histogram on figure~\ref{histogram:vm_page_fault} we can observe one more thing.
+Now, the function execution times vary more.
+It's happening because now we have more things to do when page fault is handled (e.g. copy an amap or anon).
+The optimistic result is that still most of page faults are short.
+
+\begin{figure}[h]
+  \centering
+  \createhist{plots/data-old/vm_page_fault.data}{plots/data-new/vm_page_fault.data}{xmin=0, xmax=47000}
+  \caption{\mintinline{c}{vm_page_fault}}
+  \label{histogram:vm_page_fault}
+\end{figure}
+
+One more reason, why page faults are now slower is the fact that we need to allocate additional structures, when copying page from copy-on-write segment.
+The comparison of functions used to allocate VM objects and amaps is presented on figure~\ref{histogram:alloc}.
+We can see that allocation of amaps takes more time.
+That's because, they require additional array to store references to anon structures.
+VM objects didn't require allocation of additional space, because they used linked list structure to store their pages.
+On figure~\ref{histogram:kmalloc} we can see, that the increase in \mintinline{c}{kmalloc} function usage matches the usage of amaps allocation function.
+This function is internally used by amaps to allocate memory for list of anons.
+
+To explain why some calls to \mintinline{c}{vm_amap_alloc} take so much time we have to look what function are executed during those calls.
+Those are cases, when \mintinline{c}{kmalloc} runs out of preallocated memory and have to alloc new memory pool for later allocations.
+This operation takes a lot of time because it allocates a large amount of memory in advance to make later allocations faster.
+
+\begin{figure}[h]
+  \begin{subfigure}{0.45\textwidth}
+    \centering
+    \createhist{plots/data-old/vm_object_alloc.data}{plots/data-new/vm_amap_alloc.data}{xmin=-100, xmax=22000}
+    \caption{\mintinline{c}{vm_object_alloc} vs \mintinline{c}{vm_amap_alloc}}
+    \label{histogram:alloc}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}{0.45\textwidth}
+    \centering
+    \createhist{plots/data-old/kmalloc.data}{plots/data-new/kmalloc.data}{xmin=-100, xmax=22000}
+    \caption{\mintinline{c}{kmalloc}}
+    \label{histogram:kmalloc}
+  \end{subfigure}
+  \caption{Additional allocations}
+\end{figure}
+
+We can think about optimizing it, but we can't use simple linked list as before.
+Because pages are shared between multiple amaps we would need to store them on multiple linked lists.
+For each such list, a pointer to next list item must be saved somewhere.
+This means, we would have to allocate some amount of memory for such pointers in each anon, but this is wasteful,
+because we don't know which anons will be shared and by how many amaps.
+
+If we had decided that we still want to use VM objects to represent memory, we would have also allocate more memory.
+Instead of allocating memory for page list, we would use more VM objects (where some of them would be shadow VM objects).
+In contrast, due to reduction of number of pages that needs to be copied during process lifetime, we allocate less amaps,
+because some of them are shared between multiple VM~map entries (but we can't accurately compare it with the number of allocated VM objects,
+because we have no implementation of copy-on-write which is using old VM infrastructure).
+
+
+The new design of structures used to store pages has also good results.
+On figure~\ref{histogram:find_page} we can see a comparison of functions that are used to search for pages in VM objects and in amaps.
+We can see, that all execution of \mintinline{c}{vm_amap_find_anon} takes roughly the same time.
+It happens because we already know the offset of searched page and the anon lookup is a constant operation in amap.
+In VM objects, we had to traverse the linked list of pages to find the one we were looking for.
+The number of page lookups is greater, because page is searched during page fault, which has increased the number of occurrences.
+
+\begin{figure}[h]
+  \centering
+  \createhist{plots/data-old/vm_object_find_page.data}{plots/data-new/vm_amap_find_anon.data}{xmin=100, xmax=300}
+  \caption{old \mintinline{c}{vm_object_find_page} vs new \mintinline{c}{vm_amap_find_anon}}
+  \label{histogram:find_page}
+\end{figure}
+
+The last function in this comparison is \mintinline{c}{pmap_protect}.
+We started using it and we can clearly see that it is used a lot more than in the old VM subsystem.
+Previously it was only used during {\tt exec} to assign proper memory protection flags to segments loaded from executable file.
+Now \mintinline{c}{pmap_protect} is also used during {\tt fork} to protect copy-on-write segments from writing, until written memory is copied.
+We expected that the number of operations that require changing memory protection will increase.
+On the figure~\ref{histogram:pmap_protect} we can also see that there are various different calls to \mintinline{c}{pmap_protect} function
+because memory regions of different size are protected.
+
+\begin{figure}[h]
+  \centering
+  \createhist{plots/data-old/pmap_protect.data}{plots/data-new/pmap_protect.data}{}
+  \caption{\mintinline{c}{pmap_protect}}
+  \label{histogram:pmap_protect}
+\end{figure}
+
+Additional analysis shows that the \mintinline{c}{pmap_protect} is the main cause of additional time spent in the VM functions.
+If we calculate total time of \mintinline{c}{vm_map_clone} and \mintinline{c}{vm_page_fault} in both old and new implementations we can see that
+the difference between them is roughly the total time of \mintinline{c}{pmap_protect} function.
+Total running times of mentioned functions are listed in the table~\ref{table:fn_times}.
+
+\begin{table}[h]
+  \centering
+  \begin{tabular}{ |l|r|r|r|r| }
+   \hline
+    Function name & Count & Total time \\
+   \hline
+   \hline
+    \mintinline{c}{vm_map_clone} (old) & 146 & 16508512 \\
+    \mintinline{c}{vm_map_clone} (new) & 146 &  9356264 \\
+   \hline
+   \hline
+    \mintinline{c}{vm_page_fault} (old) & 2958 & 12695736 \\
+    \mintinline{c}{vm_page_fault} (new) & 3668 & 26167512 \\
+   \hline
+   \hline
+    \mintinline{c}{pmap_protect} (old) &   30 &   48360 \\
+    \mintinline{c}{pmap_protect} (new) & 1041 & 6972618 \\
+   \hline
+  \end{tabular}
+  \caption{Comparison of total execution time of VM functions}
+  \label{table:fn_times}
+\end{table}
+
+\subsubsection{Summary of performance analysis}
+
+The above performance comparisons show two things: the new implementation is more effective in terms of memory usage,
+but its slightly slower than the previous solution.
+The first outcome is expected, because that is the reason why we wanted to implement copy-on-write mechanism in Mimiker.
+The second result is in fact hard to analyze.
+To be 100\% sure which implementation of VM is better in terms of time consumption we should have compared two versions of VM with the same set of features.
+In our case it isn't possible, because the old version doesn't have implemented a copy-on-write mechanism.
+However, the performance analysis described in \cite{cranor} shows that the design used by UVM is more effective than the traditional one previously used in NetBSD.
+
+The other reason why this performance improvement cannot be directly measured in Mimiker, is that there are still left some features to implement.
+The VM subsystem is still simplified in comparison to fully functioning UVM implementation.
+The new design will help with effective implementation of other parts of the VM such as memory mapped files and paging mechanism.
+
+\section{Generating data for analysis}
+
+To generated the data for the performance analysis we have to obtain the Mimiker source code.
+Whole Mimiker project is maintained in a single repository on GitHub \cite{mimiker:sources}.
+It contains: the source code, tests, userspace programs, scripts to build and run Mimiker simulation, toolchain needed to develop Mimiker
+and a documentation.
+
+\subsection{Toolchain installation}
+
+To develop and use Mimiker we need to install a custom toolchain.
+All sources needed to compile custom programs are included in Mimiker's repository in {\tt toolchain} directory.
+Installation steps and other helpful information about Mimiker development can be found on the project wiki page \cite{mimiker:wiki}.
+
+\subsection{Building Mimiker}
+
+Right before building Mimiker we have to adjust the configuration file to enable KFT instrumentation.
+Configuration is read from {\tt config.mk} file in Mimiker's root directory.
+To enable KFT we need to set {\tt KFI} flag ({\it Kernel Function Instrumentation}) to {\tt ftrace}.
+
+After adjusting configuration we can finally build OS by running {\tt make} command.
+The most important file produced during build, in context of later analysis, is the Mimiker binary present at path {\tt sys/mimiker.elf}.
+
+\subsection{Running and collecting KFT dump}
+
+After successful build we can finally start a Mimiker simulation in Qemu.
+We use {\tt launch} script to run Mimiker and specify configuration options to adjust the running environment and specify program that will be executed.
+In our case the command is: {\tt ./launch -b rpi3 -d -k utest=all}.
+
+\begin{itemize}
+  \item {\tt -b rpi3} -- specifies the board that the Mimiker was build for ({\tt rpi3} is the default board)
+  \item {\tt -d} -- starts debugging session
+  \item {\tt -k} -- enables support for collecting KFT dumps by the debugger
+  \item {\tt utest=all} -- specifies that we want to run all user space tests
+\end{itemize}
+
+After tests have finished we have to manually close the debugging window that was opened (e.g. by hitting {\tt Ctrl+B D} sequence).
+KFT dump is saved to {\tt dump.kft} file on a host machine.
+
+\subsection{Analyzing KFT dump}
+
+Finally, we can use a Python script to generate data that is easier to analyze: call graphs of given functions and data needed to create plots.
+To use {\tt kftlib} we have to install it using \mintinline{sh}{pip install ./kftlib} command in the Mimiker directory.
+Example script that can be used to generate date for plots in previous section is presented on listing~\ref{impl:kft_script}.
+More advanced scripts as well as the details of {\tt kftlib} can be seen in the \pr{1418}{KFT python lib}.
+
+\begin{listing}[h]
+\begin{minted}{python}
+#!/usr/bin/env python3
+import kftlib
+import statistics
+import os
+
+def get_fn_times(events, elf, functions, out):
+    fn_pcs = list(map(lambda fn: elf.fun2pc.get(fn), functions))
+    fn_times = kftlib.get_functions_times(events, fn_pcs)
+    os.makedirs(out, exist_ok=True)
+
+    print(f"{'function':>13}: {'count':>5} {'avg time':>8}")
+
+    for fn, pc in zip(functions, fn_pcs):
+        if pc and pc in fn_times:
+            # Print short summary
+            avg_time = statistics.mean(fn_times[pc])
+            count = len(fn_times[pc])
+            print(f"{fn:>13}: {count:>5} {avg_time:>8.0f}")
+            # Dump all invocations to file
+            with open(f"{out}/{fn}.data", "w") as f:
+                f.write("\n".join(str(t) for t in fn_times[pc]) + '\n')
+
+def main():
+    functions = [
+        "vm_amap_find_anon", "vm_object_find_page", "vm_page_fault",
+        "pmap_protect", "pmap_copy_page", "vm_page_alloc",
+        "vm_map_clone", "vm_amap_alloc", "vm_object_alloc",
+    ]
+    input = [
+        ("new.elf", "new.kft", "new-data"),
+        ("old.elf", "old.kft", "old-data"),
+    ]
+    for elf_p, kft_p, out_dir in input:
+        elf = kftlib.Elf.inspect_elf_file(elf_p)
+        events = kftlib.inspect_kft_file(kft_p, elf)
+        get_fn_times(events, elf, functions, out_dir)
+
+main()
+    \end{minted}
+  \caption{Python script used to generate data for graphs in previous section}
+  \label{impl:kft_script}
+\end{listing}
+

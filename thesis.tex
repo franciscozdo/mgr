@@ -1,0 +1,111 @@
+\documentclass[declaration,shortabstract,english,mgr,pdftex,dvipsnames]{iithesis}
+
+\graphicspath{{img/}}
+
+\usepackage{minted}
+\usepackage{pifont}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{indentfirst}
+\usepackage{bytefield}
+\usepackage{pgfplots}
+\usepackage{caption}
+\usepackage{subcaption}
+
+\setlength{\parindent}{1em}
+\setmintedinline{breaklines,breakafter=,}
+
+\pgfplotsset{compat=newest}
+\pgfplotsset{scaled x ticks=false, scaled y ticks=false}
+
+\newcommand{\comment}[1]{{
+  \it \noindent
+  \color{purple}
+  COMMENT: #1
+}}
+
+\newcommand{\pr}[2]{{\tt (\##1) #2}\footnote{\url{https://github.com/cahirwpz/mimiker/pull/#1}}}
+
+% Arguments
+% 1 - file with old
+% 2 - file with new
+% 3 - additional axis args
+\newcommand{\createhist}[3]{
+  \begin{tikzpicture}[font=\tiny, trim axis left, trim axis right]
+    \begin{axis}[ybar, ymin=0, #3]
+      \addplot +[hist={data=x, bins=100}, opacity=0.5, draw=none, gray] table [y index=0] {#1};
+      \addplot +[hist={data=x, bins=100}, opacity=0.5, draw=none, blue] table [y index=0] {#2};
+      \legend{
+        Old -- \input|"wc -l #1 | cut -d' ' -f1" invocations,
+        New -- \input|"wc -l #2 | cut -d' ' -f1" invocations
+      }
+    \end{axis}
+  \end{tikzpicture}
+}
+
+\newcommand{\createbar}[2]{
+  \begin{tikzpicture}[font=\tiny, trim axis left, trim axis right]
+    \begin{axis}[
+        xmin=0, xmax=3, xtick={1,2},
+        x tick style={draw=none},
+        xticklabels={Old,New},
+        ymin=0,
+        nodes near coords,
+        every axis plot/.append style={
+          ybar,
+          bar width=1cm,
+          bar shift=0pt,
+          fill,
+          text opacity=1, fill opacity=0.5,
+        }
+    ]
+      \addplot[draw=none, fill=gray] coordinates {(1, #1)};
+      \addplot[draw=none, fill=blue] coordinates {(2, #2)};
+    \end{axis}
+  \end{tikzpicture}
+}
+
+
+\author{Franciszek Zdobylak}
+\transcriptnum{XXXXXX}
+\advisor{
+    Krystian Bacławski
+  \fmlinebreak
+    Piotr Witkowski
+}
+
+\englishtitle{Effective copy-on-write mechanism \fmlinebreak for the Mimiker kernel}
+\polishtitle{Efektywny mechanizm copy-on-write \fmlinebreak dla systemu operacyjnego Mimiker}
+
+\englishabstract{
+  This thesis presents an implementation of the virtual memory subsystem in the Mimiker operating system.
+  It was created to enable the implementation of an efficient copy-on-write mechanism.
+  The described implementation is based on a solution called UVM derived from the NetBSD system.
+  Improvements in operating system memory management are particularly important, since memory is one of the most important resources in
+  computer systems.
+  The performance of a system can be estimated by measuring two factors: the memory used and the time taken to execute individual functions.
+  This work also presents a performance analysis of the implemented solution.
+}
+
+\polishabstract{
+  Niniejsza praca przedstawia implementację systemu pamięci wirtualnej w systemie operacyjnym Mimiker.
+  Została ona stworzona, aby umożliwić zaimplementowanie efektywnego mechanizmu copy-on-write.
+  Opisana implemenatacja jest oparta na rozwiązaniu o nazwie UVM pochodzącym z systemu NetBSD.
+  Usprawnienia w zakresie zarządzania pamięcią systemu operacyjnego są szczególnie ważne, ponieważ pamięć jest jednym z najważniejszych zasobów w
+  systemach komputerowych.
+  Wydajność systemu można oszacować mierząc dwa czynniki: użytą pamięć oraz czas wykonywania poszczególnych funkcji.
+  W tej pracy jest również przedstawiona analiza wydajności zaimplementowanego rozwiązania.
+}
+
+\begin{document}
+\include{chapters/introduction.tex}
+\include{chapters/vm_overview.tex}
+\include{chapters/details.tex}
+\include{chapters/mimiker.tex}
+\include{chapters/performance.tex}
+\include{chapters/conclusion.tex}
+
+\bibliographystyle{unsrt}
+\bibliography{bibliography}
+
+\end{document}
